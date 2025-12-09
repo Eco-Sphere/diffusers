@@ -36,8 +36,15 @@ from ..embeddings import (
 )
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
-from ..normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
-
+if is_torch_npu_available:
+    from ..normalization import AdaLayerNormContinuousNpu as AdaLayerNormContinuous
+    from ..normalization import AdaLayerNormZeroNpu as AdaLayerNormZero
+    from ..normalization import AdaLayerNormZeroSingleNpu as AdaLayerNormZeroSingle
+    
+    op_path="/root/lym/op_build/build/lib.linux-x86_64-cpython-311/ascend_ops.cpython-311-x86_64-linux-gnu.so"
+    torch.ops.load_library(op_path)
+else:
+    from ..normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -114,7 +121,7 @@ class FluxAttnProcessor:
         if image_rotary_emb is not None:
             query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
             key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
-
+        
         hidden_states = dispatch_attention_fn(
             query,
             key,
@@ -272,6 +279,27 @@ class FluxIPAdapterAttnProcessor(torch.nn.Module):
             return hidden_states
 
 
+class RMSNormNpu(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, elementwise_affine=True):
+        """
+        RMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        import torch_npu
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+        self.fused_norm = torch_npu.npu_rms_norm
+
+    def forward(self, hidden_states, if_fused=True):
+        if if_fused:
+            return self.fused_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]
+        else:
+            input_dtype = hidden_states.dtype
+            hidden_states = hidden_states.to(torch.float32)
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+            return self.weight * hidden_states.to(input_dtype)
+
 class FluxAttention(torch.nn.Module, AttentionModuleMixin):
     _default_processor_cls = FluxAttnProcessor
     _available_processors = [
@@ -309,9 +337,14 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         self.heads = out_dim // dim_head if out_dim is not None else heads
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
+        
+        if is_torch_npu_available:
+            RMSNorm = RMSNormNpu
+        else:
+            RMSNorm = torch.nn.RMSNorm
 
-        self.norm_q = torch.nn.RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
-        self.norm_k = torch.nn.RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
+        self.norm_q = RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
+        self.norm_k = RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
         self.to_q = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
         self.to_k = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
         self.to_v = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
@@ -322,8 +355,8 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             self.to_out.append(torch.nn.Dropout(dropout))
 
         if added_kv_proj_dim is not None:
-            self.norm_added_q = torch.nn.RMSNorm(dim_head, eps=eps)
-            self.norm_added_k = torch.nn.RMSNorm(dim_head, eps=eps)
+            self.norm_added_q = RMSNorm(dim_head, eps=eps)
+            self.norm_added_k = RMSNorm(dim_head, eps=eps)
             self.add_q_proj = torch.nn.Linear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias)
             self.add_k_proj = torch.nn.Linear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias)
             self.add_v_proj = torch.nn.Linear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias)
@@ -360,7 +393,11 @@ class FluxSingleTransformerBlock(nn.Module):
 
         self.norm = AdaLayerNormZeroSingle(dim)
         self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim)
-        self.act_mlp = nn.GELU(approximate="tanh")
+        if is_torch_npu_available:
+            import torch_npu
+            self.act_mlp = torch_npu.npu_fast_gelu
+        else:
+            self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
 
         self.attn = FluxAttention(
@@ -432,6 +469,7 @@ class FluxTransformerBlock(nn.Module):
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+            
         self.ff_context = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
     def forward(
@@ -466,8 +504,15 @@ class FluxTransformerBlock(nn.Module):
         attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = hidden_states + attn_output
 
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        if is_torch_npu_available:
+            norm_hidden_states = torch.ops.ascend_ops.adalayernorm(
+                x=hidden_states, 
+                scale=scale_mlp[:, None], 
+                shift=shift_mlp[:, None], 
+                epsilson=1e-6)
+        else:
+            norm_hidden_states = self.norm2(hidden_states)
+            norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
 
         ff_output = self.ff(norm_hidden_states)
         ff_output = gate_mlp.unsqueeze(1) * ff_output
@@ -480,8 +525,15 @@ class FluxTransformerBlock(nn.Module):
         context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+        if is_torch_npu_available:
+            norm_encoder_hidden_states = torch.ops.ascend_ops.adalayernorm(
+                x=encoder_hidden_states, 
+                scale=c_scale_mlp[:, None], 
+                shift=c_shift_mlp[:, None], 
+                epsilson=1e-6)
+        else:
+            norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+            norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
         encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
@@ -633,6 +685,7 @@ class FluxTransformer2DModel(
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
         self.gradient_checkpointing = False
+        self.image_rotary_emb = None
 
     def forward(
         self,
@@ -717,11 +770,12 @@ class FluxTransformer2DModel(
             img_ids = img_ids[0]
 
         ids = torch.cat((txt_ids, img_ids), dim=0)
-        if is_torch_npu_available():
-            freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
-            image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
-        else:
-            image_rotary_emb = self.pos_embed(ids)
+        if self.image_rotary_emb is None:
+            if is_torch_npu_available():
+                freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
+                image_rotary_emb = (freqs_cos.npu().to(hidden_states.dtype), freqs_sin.npu().to(hidden_states.dtype))
+            else:
+                image_rotary_emb = self.pos_embed(ids)
 
         if joint_attention_kwargs is not None and "ip_adapter_image_embeds" in joint_attention_kwargs:
             ip_adapter_image_embeds = joint_attention_kwargs.pop("ip_adapter_image_embeds")
